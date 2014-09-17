@@ -27,9 +27,22 @@ class Redis
         @connection = connection
         @monitoring_thread = nil
         @writer = nil
+        @exec_command_queue = Queue.new
+        @error_queue = Queue.new
+        listen_and_perform
+      end
+
+      def listen_and_perform
+        @monitoring_thread = Thread.new do
+          loop do
+            command = @exec_command_queue.pop
+            command.call
+          end
+        end
       end
 
       def connected?
+        listen_and_perform unless @monitoring_thread && ["sleep", "run"].include?(@monitoring_thread.status)
         @connection && @connection.connected?
       end
 
@@ -39,7 +52,6 @@ class Redis
       end
 
       def disconnect
-        @monitoring_thread.terminate if @monitoring_thread
         @writer.close if @writer && !@writer.closed?
         @connection.disconnect
         @connection = nil
@@ -52,10 +64,11 @@ class Redis
       end
 
       def read
-        read_result = read_with_pipe
+        read_result = error = nil
 
         begin
-          @monitoring_thread.join
+          read_result = read_with_pipe
+          raise @error_queue.pop(true) unless @error_queue.empty?
         rescue Errno::EAGAIN
           raise TimeoutError
         rescue RuntimeError => err
@@ -72,10 +85,12 @@ class Redis
       def read_with_pipe
         reader, @writer = IO.pipe
 
-        @monitoring_thread = Thread.new do
+        @exec_command_queue << Proc.new do
           begin
             @reply = @connection.read
             @writer.write("Done")
+          rescue Exception => e
+            @error_queue << e
           ensure
             @writer.close unless @writer.closed?
           end
